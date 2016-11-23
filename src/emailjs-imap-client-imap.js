@@ -117,6 +117,7 @@
                 binaryType: 'arraybuffer',
                 useSecureTransport: this.secureMode,
                 ca: this.options.ca,
+                ws: this.options.ws,
                 tlsWorkerPath: this.options.tlsWorkerPath
             });
 
