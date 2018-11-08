@@ -92,7 +92,7 @@
     /**
      * Lower Bound for socket timeout to wait since the last data was written to a socket
      */
-    Imap.prototype.TIMEOUT_SOCKET_LOWER_BOUND = 10000;
+    Imap.prototype.TIMEOUT_SOCKET_LOWER_BOUND = 60000; //10000
 
     /**
      * Multiplier for socket timeout:
