@@ -340,7 +340,7 @@
     Imap.prototype.send = function(str) {
         var buffer = mimecodec.toTypedArray(str).buffer,
             timeout = this.TIMEOUT_SOCKET_LOWER_BOUND + Math.floor(buffer.byteLength * this.TIMEOUT_SOCKET_MULTIPLIER);
-
+		this.logger.debug('socketTimeout', timeout, this.TIMEOUT_SOCKET_LOWER_BOUND)
         clearTimeout(this._socketTimeoutTimer); // clear pending timeouts
         this._socketTimeoutTimer = setTimeout(() => this._onError(new Error(this.options.sessionId + ' Socket timed out!')), timeout); // arm the next timeout
 
