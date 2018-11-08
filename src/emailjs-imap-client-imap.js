@@ -2,7 +2,7 @@
     'use strict';
 
     if (typeof define === 'function' && define.amd) {
-        define(['emailjs-tcp-socket', 'emailjs-imap-handler', 'emailjs-mime-codec', 'emailjs-imap-client-compression'], factory);
+        define(['emailjs-tcp-socket', 'emailjs-imap-handler', 'emailjs-mime-codec', './emailjs-imap-client-compression'], factory);
     } else if (typeof exports === 'object') {
         module.exports = factory(require('emailjs-tcp-socket'), require('emailjs-imap-handler'), require('emailjs-mime-codec'), require('./emailjs-imap-client-compression'), null);
     }
@@ -18,8 +18,13 @@
     var MESSAGE_DEFLATE = 'deflate';
     var MESSAGE_DEFLATED_DATA_READY = 'deflated_ready';
 
-    var COMMAND_REGEX = /(\{(\d+)(\+)?\})?\r?\n/;
     var EOL = '\r\n';
+    var LINE_FEED = 10;
+    var CARRIAGE_RETURN = 13;
+    var LEFT_CURLY_BRACKET = 123;
+    var RIGHT_CURLY_BRACKET = 125;
+
+    var ASCII_PLUS = 43;
 
     /**
      * Creates a connection object to an IMAP server. Call `connect` method to inititate
@@ -65,8 +70,7 @@
         //
 
         // As the server sends data in chunks, it needs to be split into separate lines. Helps parsing the input.
-        this._incomingBuffer = '';
-        this._command = '';
+        this._incomingBuffers = [];
         this._literalRemaining = 0;
 
         //
@@ -99,6 +103,11 @@
      */
     Imap.prototype.TIMEOUT_SOCKET_MULTIPLIER = 0.1;
 
+    /**
+     * Timeout used in _onData, max packet size is 4096 bytes.
+     */
+    Imap.prototype.ON_DATA_TIMEOUT = Imap.prototype.TIMEOUT_SOCKET_LOWER_BOUND + Math.floor(4096 * Imap.prototype.TIMEOUT_SOCKET_MULTIPLIER);
+
     // PUBLIC METHODS
 
     /**
@@ -117,7 +126,6 @@
                 binaryType: 'arraybuffer',
                 useSecureTransport: this.secureMode,
                 ca: this.options.ca,
-                ws: this.options.ws,
                 tlsWorkerPath: this.options.tlsWorkerPath
             });
 
@@ -155,9 +163,16 @@
      *
      * @returns {Promise} Resolves when the socket is closed
      */
-    Imap.prototype.close = function() {
+    Imap.prototype.close = function(error) {
         return new Promise((resolve) => {
             var tearDown = () => {
+
+                // fulfill pending promises
+                this._clientQueue.forEach(cmd => cmd.callback(error));
+                if (this._currentCommand) {
+                    this._currentCommand.callback(error);
+                }
+
                 this._clientQueue = [];
                 this._currentCommand = false;
 
@@ -204,7 +219,7 @@
     Imap.prototype.logout = function() {
         return new Promise((resolve, reject) => {
             this.socket.onclose = this.socket.onerror = () => {
-                this.close().then(resolve).catch(reject);
+                this.close("Client logging out").then(resolve).catch(reject);
             };
 
             this.enqueueCommand('LOGOUT');
@@ -289,6 +304,34 @@
     };
 
     /**
+     *
+     * @param commands
+     * @param ctx
+     * @returns {*}
+     */
+    Imap.prototype.getPreviouslyQueued = function(commands, ctx) {
+        const startIndex = this._clientQueue.indexOf(ctx) - 1;
+
+        // search backwards for the commands and return the first found
+        for (let i = startIndex; i >= 0; i--) {
+            if (isMatch(this._clientQueue[i])) {
+                return this._clientQueue[i];
+            }
+        }
+
+        // also check current command if no SELECT is queued
+        if (isMatch(this._currentCommand)) {
+            return this._currentCommand;
+        }
+
+        return false;
+
+        function isMatch(data) {
+            return data && data.request && commands.indexOf(data.request.command) >= 0;
+        }
+    };
+
+    /**
      * Send data to the TCP socket
      * Arms a timeout waiting for a response from the server.
      *
@@ -341,7 +384,7 @@
         this.logger.error(error);
 
         // always call onerror callback, no matter if close() succeeds or fails
-        this.close().then(() => {
+        this.close(error).then(() => {
             this.onerror && this.onerror(error);
         }, () => {
             this.onerror && this.onerror(error);
@@ -357,47 +400,112 @@
      * @param {Event} evt
      */
     Imap.prototype._onData = function(evt) {
-        clearTimeout(this._socketTimeoutTimer); // clear the timeout, the socket is still up
-        this._socketTimeoutTimer = null;
+        clearTimeout(this._socketTimeoutTimer); // reset the timeout on each data packet
+        this._socketTimeoutTimer = setTimeout(() => this._onError(new Error(this.options.sessionId + ' Socket timed out!')), this.ON_DATA_TIMEOUT);
 
-        this._incomingBuffer += mimecodec.fromTypedArray(evt.data); // append to the incoming buffer
+        this._incomingBuffers.push(new Uint8Array(evt.data)); // append to the incoming buffer
         this._parseIncomingCommands(this._iterateIncomingBuffer()); // Consume the incoming buffer
     };
 
-    Imap.prototype._iterateIncomingBuffer = function* () {
-        var match;
-        // The input is interesting as long as there are complete lines
-        while ((match = this._incomingBuffer.match(COMMAND_REGEX))) {
-            if (this._literalRemaining && this._literalRemaining > this._incomingBuffer.length) {
-                // we're expecting more incoming literal data than available, wait for the next chunk
-                return;
-            }
+    Imap.prototype._iterateIncomingBuffer = function*() {
+        let buf;
+        if (this._concatLastTwoBuffers) {
+            // allocate new buffer for the sake of simpler parsing
+            delete this._concatLastTwoBuffers;
+            const latest = this._incomingBuffers.pop();
+            const prevBuf = this._incomingBuffers[this._incomingBuffers.length-1];
+            buf = new Uint8Array(prevBuf.length + latest.length);
+            buf.set(prevBuf);
+            buf.set(latest, prevBuf.length);
+            this._incomingBuffers[this._incomingBuffers.length-1] = buf;
+        } else {
+            buf = this._incomingBuffers[this._incomingBuffers.length-1];
+        }
+        let i = 0;
 
-            if (this._literalRemaining) {
-                // we're expecting incoming literal data:
-                // take portion of pending literal data from the chunk, parse the remaining buffer in the next iteration
-                this._command += this._incomingBuffer.substr(0, this._literalRemaining);
-                this._incomingBuffer = this._incomingBuffer.substr(this._literalRemaining);
-                this._literalRemaining = 0;
-                continue;
-            }
+        // loop invariant:
+        //   this._incomingBuffers starts with the beginning of incoming command.
+        //   buf is shorthand for last element of this._incomingBuffers.
+        //   buf[0..i-1] is part of incoming command.
+        while (i < buf.length) {
+          if (this._literalRemaining === 0) {
+              const leftIdx = buf.indexOf(LEFT_CURLY_BRACKET, i);
+              if (leftIdx > -1) {
+                  const leftOfLeftCurly = new Uint8Array(buf.buffer, i, leftIdx-i);
+                  if (leftOfLeftCurly.indexOf(LINE_FEED) === -1) {
+                      let j = leftIdx + 1;
+                      while (buf[j] >= 48 && buf[j] <= 57) { // digits
+                          j++;
+                      }
+                      if (j+3 >= buf.length) {
+                          // not enough info to determine if this is literal length
+                          this._concatLastTwoBuffers = true;
+                          return;
+                      }
+                      if (j > leftIdx + 1 &&
+                              buf[j] === RIGHT_CURLY_BRACKET &&
+                              buf[j+1] === CARRIAGE_RETURN &&
+                              buf[j+2] === LINE_FEED) {
+                          const numBuf = buf.subarray(leftIdx+1, j);
+                          this._literalRemaining = Number(mimecodec.fromTypedArray(numBuf));
+                          i = j + 3;
+                      } else {
+                          i = j;
+                          continue; // not a literal but there might still be one
+                      }
+                  }
+              }
+          }
 
-            if (match[2]) {
-                // we have a literal data command:
-                // take command portion (match.index) including the literal data octet count (match[0].length)
-                // from the chunk, parse the literal data in the next iteration
-                this._literalRemaining = Number(match[2]);
-                this._command += this._incomingBuffer.substr(0, match.index + match[0].length);
-                this._incomingBuffer = this._incomingBuffer.substr(match.index + match[0].length);
-                continue;
-            }
+          const diff = Math.min(buf.length-i, this._literalRemaining);
+          if (diff) {
+              this._literalRemaining -= diff;
+              i += diff;
+              if (this._literalRemaining === 0) {
+                  continue; // find another literal
+              }
+          }
 
-            // we have a complete command, pass on to processing
-            this._command += this._incomingBuffer.substr(0, match.index);
-            this._incomingBuffer = this._incomingBuffer.substr(match.index + match[0].length);
-            yield this._command;
+          if (this._literalRemaining === 0 && i < buf.length) {
+              const LFidx = buf.indexOf(LINE_FEED, i);
+              if (LFidx > -1) {
+                  if (LFidx < buf.length-1) {
+                      this._incomingBuffers[this._incomingBuffers.length-1] = new Uint8Array(buf.buffer, 0, LFidx+1);
+                  }
+                  const commandLength = this._incomingBuffers.reduce((prev, curr) => prev + curr.length, 0) - 2; // 2 for CRLF
+                  const command = new Uint8Array(commandLength);
+                  let index = 0;
+                  while (this._incomingBuffers.length > 0) {
+                      let uint8Array = this._incomingBuffers.shift();
 
-            this._command = ''; // clear for next iteration
+                      const remainingLength = commandLength - index;
+                      if (uint8Array.length > remainingLength) {
+                          const excessLength = uint8Array.length - remainingLength;
+                          uint8Array = uint8Array.subarray(0, -excessLength);
+
+                          if (this._incomingBuffers.length > 0) {
+                              this._incomingBuffers = [];
+                          }
+                      }
+                      command.set(uint8Array, index);
+                      index += uint8Array.length;
+                  }
+                  yield command;
+                  if (LFidx < buf.length-1) {
+                      buf = new Uint8Array(buf.subarray(LFidx+1));
+                      this._incomingBuffers.push(buf);
+                      i = 0;
+                  } else {
+                      // clear the timeout when an entire command has arrived
+                      // and not waiting on more data for next command
+                      clearTimeout(this._socketTimeoutTimer);
+                      this._socketTimeoutTimer = null;
+                      return;
+                  }
+              } else {
+                  return;
+              }
+          }
         }
     };
 
@@ -423,7 +531,7 @@
              *   https://tools.ietf.org/html/rfc3501#section-2.2.1
              */
             //
-            if (/^\+/.test(command)) {
+            if (command[0] === ASCII_PLUS) {
                 if (this._currentCommand.data.length) {
                     // feed the next chunk of data
                     var chunk = this._currentCommand.data.shift();
@@ -437,8 +545,8 @@
 
             var response;
             try {
-                response = imapHandler.parser(command.trim());
-                this.logger.debug('S:', imapHandler.compiler(response, false, true));
+                response = imapHandler.parser(command);
+                this.logger.debug('S:', () => imapHandler.compiler(response, false, true));
             } catch (e) {
                 this.logger.error('Error parsing imap command!', response);
                 return this._onError(e);
@@ -476,8 +584,6 @@
         } else if (response.tag === '*' && command in this._globalAcceptUntagged) {
             // unexpected untagged response
             this._globalAcceptUntagged[command](response);
-            this._canSend = true;
-            this._sendRequest();
         } else if (response.tag === this._currentCommand.tag) {
             // tagged response
             if (this._currentCommand.payload && Object.keys(this._currentCommand.payload).length) {
@@ -540,7 +646,7 @@
 
         try {
             this._currentCommand.data = imapHandler.compiler(this._currentCommand.request, true);
-            this.logger.debug('C:', imapHandler.compiler(this._currentCommand.request, false, true)); // excludes passwords etc.
+            this.logger.debug('C:', () => imapHandler.compiler(this._currentCommand.request, false, true)); // excludes passwords etc.
         } catch (e) {
             this.logger.error('Error compiling imap command!', this._currentCommand.request);
             return this._onError(new Error('Error compiling imap command!'));

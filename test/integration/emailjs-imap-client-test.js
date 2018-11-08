@@ -46,7 +46,9 @@
                                     "Sent Mail": { "special-use": "\\Sent" },
                                     "Spam": { "special-use": "\\Junk" },
                                     "Starred": { "special-use": "\\Flagged" },
-                                    "Trash": { "special-use": "\\Trash" }
+                                    "Trash": { "special-use": "\\Trash" },
+                                    "A": { messages: [{}] },
+                                    "B": { messages: [{}] }
                                 }
                             }
                         }
@@ -81,7 +83,7 @@
                 insecureServer.close(done);
             });
 
-            it('should use STARTTLS by default', () => {
+            it('should use STARTTLS by default', (done) => {
                 imap = new ImapClient('127.0.0.1', port, {
                     auth: {
                         user: "testuser",
@@ -91,14 +93,14 @@
                 });
                 imap.logLevel = imap.LOG_LEVEL_NONE;
 
-                return imap.connect().then(() => {
+                imap.connect().then(() => {
                     expect(imap.client.secureMode).to.be.true;
                 }).then(() => {
                     return imap.close();
-                });
+                }).then(() => done()).catch(done);
             });
 
-            it('should ignore STARTTLS', () => {
+            it('should ignore STARTTLS', (done) => {
                 imap = new ImapClient('127.0.0.1', port, {
                     auth: {
                         user: "testuser",
@@ -113,7 +115,7 @@
                     expect(imap.client.secureMode).to.be.false;
                 }).then(() => {
                     return imap.close();
-                });
+                }).then(() => done()).catch(done);
             });
 
             it('should fail connecting to non-STARTTLS host', (done) => {
@@ -390,6 +392,38 @@
                         }).catch(done);
                     });
                 });
+
+                it('should select correct mailboxes in prechecks on concurrent calls', (done) => {
+                    imap.selectMailbox('[Gmail]/A').then(() => {
+                      return Promise.all([
+                        imap.selectMailbox('[Gmail]/B'),
+                        imap.setFlags('[Gmail]/A', '1', ['\\Seen'])
+                      ]);
+                    }).then(() => {
+                        return imap.listMessages('[Gmail]/A', '1:1', ['flags']);
+                    }).then((messages) => {
+                        expect(messages.length).to.equal(1);
+                        expect(messages[0].flags).to.deep.equal(['\\Seen']);
+                        done();
+                    }).catch(done);
+                });
+
+                it('should send precheck commands in correct order on concurrent calls', (done) => {
+                    Promise.all([
+                        imap.setFlags('[Gmail]/A', '1', ['\\Seen']),
+                        imap.setFlags('[Gmail]/B', '1', ['\\Seen'])
+                    ]).then(() => {
+                        return imap.listMessages('[Gmail]/A', '1:1', ['flags']);
+                    }).then((messages) => {
+                        expect(messages.length).to.equal(1);
+                        expect(messages[0].flags).to.deep.equal(['\\Seen']);
+                    }).then(() => {
+                        return imap.listMessages('[Gmail]/B', '1:1', ['flags']);
+                    }).then((messages) => {
+                        expect(messages.length).to.equal(1);
+                        expect(messages[0].flags).to.deep.equal(['\\Seen']);
+                    }).then(done).catch(done);
+                });
             });
         });
 
@@ -406,20 +440,43 @@
                 });
                 imap.logLevel = imap.LOG_LEVEL_NONE;
 
-                return imap.connect();
+                return imap.connect()
+                .then(() => {
+                    // remove the ondata event to simulate 100% packet loss and make the socket time out after 10ms
+                    imap.client.TIMEOUT_SOCKET_LOWER_BOUND = 10;
+                    imap.client.TIMEOUT_SOCKET_MULTIPLIER = 0;
+                    imap.client.socket.ondata = () => {};
+                });
             });
 
             it('should timeout', (done) => {
-                // remove the ondata event to simulate 100% packet loss and make the socket time out after 10ms
-                imap.client.TIMEOUT_SOCKET_LOWER_BOUND = 10;
-                imap.client.TIMEOUT_SOCKET_MULTIPLIER = 0;
-                imap.client.socket.ondata = () => {};
-
                 imap.onerror = () => {
                     done();
                 };
 
                 imap.selectMailbox('inbox');
+            });
+
+            it('should reject all pending commands on timeout', (done) => {
+                let rejectionCount = 0;
+                Promise.all([
+
+                    imap.selectMailbox("INBOX")
+                    .catch(err => {
+                        expect(err).to.exist;
+                        rejectionCount++;
+                    }),
+
+                    imap.listMessages("INBOX", "1:*", ['body.peek[]'])
+                    .catch(err => {
+                        expect(err).to.exist;
+                        rejectionCount++;
+                    }),
+
+                ]).then(() => {
+                    expect(rejectionCount).to.equal(2);
+                    done();
+                });
             });
         });
     });

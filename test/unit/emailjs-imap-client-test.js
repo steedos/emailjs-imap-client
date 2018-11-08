@@ -2,11 +2,11 @@
 
 (function(factory) {
     if (typeof define === 'function' && define.amd) {
-        define(['chai', 'emailjs-imap-client', 'emailjs-imap-handler', './fixtures/mime-torture-bodystructure', './fixtures/envelope'], factory.bind(null, sinon));
+        define(['chai', 'emailjs-imap-client', 'emailjs-imap-handler', 'emailjs-mime-codec', './fixtures/mime-torture-bodystructure', './fixtures/envelope'], factory.bind(null, sinon));
     } else if (typeof exports === 'object') {
-        module.exports = factory(require('sinon'), require('chai'), require('../../src/emailjs-imap-client'), require('emailjs-imap-handler'), require('./fixtures/mime-torture-bodystructure'), require('./fixtures/envelope'));
+        module.exports = factory(require('sinon'), require('chai'), require('../../src/emailjs-imap-client'), require('emailjs-imap-handler'), require('emailjs-mime-codec'), require('./fixtures/mime-torture-bodystructure'), require('./fixtures/envelope'));
     }
-}(function(sinon, chai, ImapClient, imapHandler, mimeTorture, testEnvelope) {
+}(function(sinon, chai, ImapClient, imapHandler, mimefuncs, mimeTorture, testEnvelope) {
     var expect = chai.expect;
     chai.config.includeStack = true;
 
@@ -134,9 +134,7 @@
 
         describe('#exec', () => {
             beforeEach(() => {
-                sinon.stub(br, 'breakIdle', () => {
-                    return Promise.resolve();
-                });
+                sinon.stub(br, 'breakIdle');
             });
 
             it('should send string command', (done) => {
@@ -194,9 +192,9 @@
                 sinon.stub(br.client.socket, 'send');
 
                 br._enteredIdle = 'IDLE';
-                br.breakIdle().then(() => {
-                    expect([].slice.call(new Uint8Array(br.client.socket.send.args[0][0]))).to.deep.equal([0x44, 0x4f, 0x4e, 0x45, 0x0d, 0x0a]);
-                }).then(done).catch(done);
+                br.breakIdle();
+                expect([].slice.call(new Uint8Array(br.client.socket.send.args[0][0]))).to.deep.equal([0x44, 0x4f, 0x4e, 0x45, 0x0d, 0x0a]);
+                done();
             });
         });
 
@@ -518,7 +516,7 @@
                 }).returns(Promise.resolve({
                     payload: {
                         LIST: [
-                            imapHandler.parser('* LIST (\\NoInferiors) NIL "INBOX"')
+                            imapHandler.parser(mimefuncs.toTypedArray('* LIST (\\NoInferiors) NIL "INBOX"'))
                         ]
                     }
                 }));
@@ -529,7 +527,7 @@
                 }).returns(Promise.resolve({
                     payload: {
                         LSUB: [
-                            imapHandler.parser('* LSUB (\\NoInferiors) NIL "INBOX"')
+                            imapHandler.parser(mimefuncs.toTypedArray('* LSUB (\\NoInferiors) NIL "INBOX"'))
                         ]
                     }
                 }));
@@ -816,6 +814,40 @@
                 }).then(done).catch(done);
             });
         });
+
+        describe('#_shouldSelectMailbox', () => {
+            it('should return true when ctx is undefined', () => {
+                expect(br._shouldSelectMailbox('path')).to.be.true;
+            });
+
+            it('should return true when a different path is queued', () => {
+                sinon.stub(br.client, 'getPreviouslyQueued').returns({
+                    request: {
+                        command: 'SELECT',
+                        attributes: [{
+                            type: 'STRING',
+                            value: 'queued path'
+                        }]
+                    }
+                });
+
+                expect(br._shouldSelectMailbox('path', {})).to.be.true;
+            });
+
+            it('should return false when the same path is queued', () => {
+                sinon.stub(br.client, 'getPreviouslyQueued').returns({
+                    request: {
+                        command: 'SELECT',
+                        attributes: [{
+                            type: 'STRING',
+                            value: 'queued path'
+                        }]
+                    }
+                });
+
+                expect(br._shouldSelectMailbox('queued path', {})).to.be.false;
+            });
+       });
 
         describe('#selectMailbox', () => {
             beforeEach(() => {
@@ -1256,7 +1288,7 @@
                         NAMESPACE: [
                             // This specific value is returned by yahoo.co.jp's
                             // imapgate version 0.7.68_11_1.61475 IMAP server
-                            imapHandler.parser('* NAMESPACE (("" NIL)) NIL NIL')
+                            imapHandler.parser(mimefuncs.toTypedArray('* NAMESPACE (("" NIL)) NIL NIL'))
                         ]
                     }
                 })).to.deep.equal({

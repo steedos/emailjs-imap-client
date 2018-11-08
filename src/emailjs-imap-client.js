@@ -2,7 +2,7 @@
     'use strict';
 
     if (typeof define === 'function' && define.amd) {
-        define(['emailjs-imap-client-imap', 'emailjs-utf7', 'emailjs-imap-handler', 'emailjs-mime-codec', 'emailjs-addressparser'], factory);
+        define(['./emailjs-imap-client-imap', 'emailjs-utf7', 'emailjs-imap-handler', 'emailjs-mime-codec', 'emailjs-addressparser'], factory);
     } else if (typeof exports === 'object') {
         module.exports = factory(require('./emailjs-imap-client-imap'), require('emailjs-utf7'), require('emailjs-imap-handler'), require('emailjs-mime-codec'), require('emailjs-addressparser'));
     }
@@ -117,7 +117,8 @@
         }).then(() => {
             return this.upgradeConnection();
         }).then(() => {
-            return this.updateId(this.options.id);
+            return this.updateId(this.options.id)
+            .catch(err => this.logger.warn('Failed to update id', err));
         }).then(() => {
             return this.login(this.options.auth);
         }).then(() => {
@@ -127,7 +128,7 @@
             this.client.onerror = this._onError.bind(this);
         }).catch((err) => {
             this.logger.error('Could not connect to server', err);
-            this.close(); // we don't really care whether this works or not
+            this.close(err); // we don't really care whether this works or not
             throw err;
         });
     };
@@ -157,11 +158,11 @@
      *
      * @returns {Promise} Resolves when socket is closed
      */
-    Client.prototype.close = function() {
+    Client.prototype.close = function(err) {
         this._changeState(this.STATE_LOGOUT);
         clearTimeout(this._idleTimeout);
         this.logger.debug('Closing connection...');
-        return this.client.close();
+        return this.client.close(err);
     };
 
     /**
@@ -217,6 +218,22 @@
 
             this.logger.debug('Server id updated!', this.serverId);
         });
+    };
+
+    Client.prototype._shouldSelectMailbox = function(path, ctx) {
+        if (!ctx) {
+          return true;
+        }
+
+        const previousSelect = this.client.getPreviouslyQueued(['SELECT', 'EXAMINE'], ctx);
+        if (previousSelect && previousSelect.request.attributes) {
+            const pathAttribute = previousSelect.request.attributes.find((attribute) => attribute.type === 'STRING');
+            if (pathAttribute) {
+                return pathAttribute.value !== path;
+            }
+        }
+
+        return this._selectedMailbox !== path;
     };
 
     /**
@@ -413,7 +430,7 @@
         this.logger.debug('Fetching messages', sequence, 'from', path, '...');
         var command = this._buildFETCHCommand(sequence, items, options);
         return this.exec(command, 'FETCH', {
-            precheck: (ctx) => (this._selectedMailbox === path) ? Promise.resolve() : this.selectMailbox(path, { ctx: ctx })
+            precheck: (ctx) => this._shouldSelectMailbox(path, ctx) ? this.selectMailbox(path, { ctx }) : Promise.resolve()
         }).then((response) => this._parseFETCH(response));
     };
 
@@ -434,7 +451,7 @@
         this.logger.debug('Searching in', path, '...');
         var command = this._buildSEARCHCommand(query, options);
         return this.exec(command, 'SEARCH', {
-            precheck: (ctx) => (this._selectedMailbox === path) ? Promise.resolve() : this.selectMailbox(path, { ctx: ctx })
+            precheck: (ctx) => this._shouldSelectMailbox(path, ctx) ? this.selectMailbox(path, { ctx }) : Promise.resolve()
         }).then((response) => this._parseSEARCH(response));
     };
 
@@ -490,7 +507,7 @@
 
         var command = this._buildSTORECommand(sequence, action, flags, options);
         return this.exec(command, 'FETCH', {
-            precheck: (ctx) => (this._selectedMailbox === path) ? Promise.resolve() : this.selectMailbox(path, { ctx: ctx })
+            precheck: (ctx) => this._shouldSelectMailbox(path, ctx) ? this.selectMailbox(path, { ctx }) : Promise.resolve()
         }).then((response) => this._parseFETCH(response));
     };
 
@@ -572,7 +589,7 @@
                 cmd = 'EXPUNGE';
             }
             return this.exec(cmd, null, {
-                precheck: (ctx) => (this._selectedMailbox === path) ? Promise.resolve() : this.selectMailbox(path, { ctx: ctx })
+                precheck: (ctx) => this._shouldSelectMailbox(path, ctx) ? this.selectMailbox(path, { ctx }) : Promise.resolve()
             });
         });
     };
@@ -605,7 +622,7 @@
                 value: destination
             }]
         }, null, {
-            precheck: (ctx) => (this._selectedMailbox === path) ? Promise.resolve() : this.selectMailbox(path, { ctx: ctx })
+            precheck: (ctx) => this._shouldSelectMailbox(path, ctx) ? this.selectMailbox(path, { ctx }) : Promise.resolve()
         }).then((response) => (response.humanReadable || 'COPY completed'));
     };
 
@@ -646,7 +663,7 @@
                 value: destination
             }]
         }, ['OK'], {
-            precheck: (ctx) => (this._selectedMailbox === path) ? Promise.resolve() : this.selectMailbox(path, { ctx: ctx })
+            precheck: (ctx) => this._shouldSelectMailbox(path, ctx) ? this.selectMailbox(path, { ctx }) : Promise.resolve()
         });
     };
 
@@ -774,9 +791,8 @@
      * @param {Array} acceptUntagged a list of untagged responses that will be included in 'payload' property
      */
     Client.prototype.exec = function(request, acceptUntagged, options) {
-        return this.breakIdle().then(() => {
-            return this.client.enqueueCommand(request, acceptUntagged, options);
-        }).then((response) => {
+        this.breakIdle();
+        return this.client.enqueueCommand(request, acceptUntagged, options).then((response) => {
             if (response && response.capability) {
                 this._capability = response.capability;
             }
@@ -833,7 +849,7 @@
      */
     Client.prototype.breakIdle = function() {
         if (!this._enteredIdle) {
-            return Promise.resolve();
+            return;
         }
 
         clearTimeout(this._idleTimeout);
@@ -842,9 +858,6 @@
             this.logger.debug('Idle terminated');
         }
         this._enteredIdle = false;
-
-
-        return Promise.resolve();
     };
 
     /**
@@ -1097,7 +1110,7 @@
             } else if (item) {
                 try {
                     // parse the value as a fake command, use only the attributes block
-                    cmd = imapHandler.parser('* Z ' + item);
+                    cmd = imapHandler.parser(mimefuncs.toTypedArray('* Z ' + item));
                     query = query.concat(cmd.attributes || []);
                 } catch (E) {
                     // if parse failed, use the original string as one entity
@@ -1836,15 +1849,9 @@
     Client.prototype.createLogger = function() {
         var createLogger = (tag) => {
             var log = (level, messages) => {
-                messages.map((message) => {
-                    try {
-                        return typeof message.toString === 'function' ? message.toString() : JSON.stringify(message);
-                    } catch (e) {
-                        return message; // use JS builtin interpolation
-                    }
-                });
-
-                var logMessage = '[' + new Date().toISOString() + '][' + tag + '] ' + messages.join(' ');
+                messages = messages.map(msg => typeof msg === 'function' ? msg() : msg);
+                var logMessage = '[' + new Date().toISOString() + '][' + tag + '][' +
+                    this.options.auth.user + '][' + this.client.host  + '] ' + messages.join(' ');
                 if (level === this.LOG_LEVEL_DEBUG) {
                    console.log('[DEBUG]' + logMessage);
                 } else if (level === this.LOG_LEVEL_INFO) {

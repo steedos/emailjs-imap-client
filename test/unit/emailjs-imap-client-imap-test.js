@@ -133,24 +133,156 @@
 
         describe('#_iterateIncomingBuffer', () => {
             it('should iterate chunked input', () => {
-                client._incomingBuffer = '* 1 FETCH (UID 1)\r\n* 2 FETCH (UID 2)\r\n* 3 FETCH (UID 3)\r\n';
+                appendIncomingBuffer('* 1 FETCH (UID 1)\r\n* 2 FETCH (UID 2)\r\n* 3 FETCH (UID 3)\r\n');
                 var iterator = client._iterateIncomingBuffer();
 
-                expect(iterator.next().value).to.equal('* 1 FETCH (UID 1)');
-                expect(iterator.next().value).to.equal('* 2 FETCH (UID 2)');
-                expect(iterator.next().value).to.equal('* 3 FETCH (UID 3)');
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 1 FETCH (UID 1)');
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 2 FETCH (UID 2)');
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 3 FETCH (UID 3)');
                 expect(iterator.next().value).to.be.undefined;
             });
 
-            it('chould process chunked literals', () => {
-                client._incomingBuffer = '* 1 FETCH (UID {1}\r\n1)\r\n* 2 FETCH (UID {4}\r\n2345)\r\n* 3 FETCH (UID {4}\r\n3789)\r\n';
+            it('should process chunked literals', () => {
+                appendIncomingBuffer('* 1 FETCH (UID {1}\r\n1)\r\n* 2 FETCH (UID {4}\r\n2345)\r\n* 3 FETCH (UID {4}\r\n3789)\r\n');
                 var iterator = client._iterateIncomingBuffer();
 
-                expect(iterator.next().value).to.equal('* 1 FETCH (UID {1}\r\n1)');
-                expect(iterator.next().value).to.equal('* 2 FETCH (UID {4}\r\n2345)');
-                expect(iterator.next().value).to.equal('* 3 FETCH (UID {4}\r\n3789)');
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 1 FETCH (UID {1}\r\n1)');
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 2 FETCH (UID {4}\r\n2345)');
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 3 FETCH (UID {4}\r\n3789)');
                 expect(iterator.next().value).to.be.undefined;
             });
+
+            it('should process chunked literals 2', () => {
+                appendIncomingBuffer('* 1 FETCH (UID 1)\r\n* 2 FETCH (UID {4}\r\n2345)\r\n');
+                var iterator = client._iterateIncomingBuffer();
+
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 1 FETCH (UID 1)');
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 2 FETCH (UID {4}\r\n2345)');
+                expect(iterator.next().value).to.be.undefined;
+            });
+
+            it('should process chunked literals 3', () => {
+                appendIncomingBuffer('* 1 FETCH (UID {1}\r\n1)\r\n* 2 FETCH (UID 4)\r\n');
+                var iterator = client._iterateIncomingBuffer();
+
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 1 FETCH (UID {1}\r\n1)');
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 2 FETCH (UID 4)');
+                expect(iterator.next().value).to.be.undefined;
+            });
+
+            it('should process chunked literals 4', () => {
+                appendIncomingBuffer('* SEARCH {1}\r\n1 {1}\r\n2\r\n');
+                var iterator = client._iterateIncomingBuffer();
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* SEARCH {1}\r\n1 {1}\r\n2');
+            });
+
+            it('should process CRLF literal', () => {
+                appendIncomingBuffer('* 1 FETCH (UID 20 BODY[HEADER.FIELDS (REFERENCES LIST-ID)] {2}\r\n\r\n)\r\n');
+                var iterator = client._iterateIncomingBuffer();
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 1 FETCH (UID 20 BODY[HEADER.FIELDS (REFERENCES LIST-ID)] {2}\r\n\r\n)');
+            });
+
+            it('should process CRLF literal 2', () => {
+                appendIncomingBuffer('* 1 FETCH (UID 1 ENVELOPE ("string with {parenthesis}") BODY[HEADER.FIELDS (REFERENCES LIST-ID)] {2}\r\n\r\n)\r\n');
+                var iterator = client._iterateIncomingBuffer();
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 1 FETCH (UID 1 ENVELOPE ("string with {parenthesis}") BODY[HEADER.FIELDS (REFERENCES LIST-ID)] {2}\r\n\r\n)');
+            });
+
+            it('should process two commands when CRLF arrives in 2 parts', () => {
+                appendIncomingBuffer('* 1 FETCH (UID 1)\r');
+                var iterator1 = client._iterateIncomingBuffer();
+                expect(iterator1.next().value).to.be.undefined;
+
+                appendIncomingBuffer('\n* 2 FETCH (UID 2)\r\n');
+                var iterator2 = client._iterateIncomingBuffer();
+                expect(String.fromCharCode.apply(null, iterator2.next().value)).to.equal('* 1 FETCH (UID 1)');
+                expect(String.fromCharCode.apply(null, iterator2.next().value)).to.equal('* 2 FETCH (UID 2)');
+                expect(iterator2.next().value).to.be.undefined;
+            });
+
+            it('should process literal when literal count arrives in 2 parts', () => {
+                appendIncomingBuffer('* 1 FETCH (UID {');
+                var iterator1 = client._iterateIncomingBuffer();
+                expect(iterator1.next().value).to.be.undefined;
+
+                appendIncomingBuffer('2}\r\n12)\r\n');
+                var iterator2 = client._iterateIncomingBuffer();
+                expect(String.fromCharCode.apply(null, iterator2.next().value)).to.equal('* 1 FETCH (UID {2}\r\n12)');
+                expect(iterator2.next().value).to.be.undefined;
+            });
+
+            it('should process literal when literal count arrives in 2 parts 2', () => {
+                appendIncomingBuffer('* 1 FETCH (UID {1');
+                var iterator1 = client._iterateIncomingBuffer();
+                expect(iterator1.next().value).to.be.undefined;
+
+                appendIncomingBuffer('0}\r\n0123456789)\r\n');
+                var iterator2 = client._iterateIncomingBuffer();
+                expect(String.fromCharCode.apply(null, iterator2.next().value)).to.equal('* 1 FETCH (UID {10}\r\n0123456789)');
+                expect(iterator2.next().value).to.be.undefined;
+            });
+
+            it('should process literal when literal count arrives in 2 parts 3', () => {
+                appendIncomingBuffer('* 1 FETCH (UID {');
+                var iterator1 = client._iterateIncomingBuffer();
+                expect(iterator1.next().value).to.be.undefined;
+
+                appendIncomingBuffer('10}\r\n1234567890)\r\n');
+                var iterator2 = client._iterateIncomingBuffer();
+                expect(String.fromCharCode.apply(null, iterator2.next().value)).to.equal('* 1 FETCH (UID {10}\r\n1234567890)');
+                expect(iterator2.next().value).to.be.undefined;
+            });
+
+            it('should process literal when literal count arrives in 2 parts 4', () => {
+                appendIncomingBuffer('* 1 FETCH (UID 1 BODY[HEADER.FIELDS (REFERENCES LIST-ID)] {2}\r');
+                var iterator1 = client._iterateIncomingBuffer();
+                expect(iterator1.next().value).to.be.undefined;
+                appendIncomingBuffer('\nXX)\r\n');
+                var iterator2 = client._iterateIncomingBuffer();
+                expect(String.fromCharCode.apply(null, iterator2.next().value)).to.equal('* 1 FETCH (UID 1 BODY[HEADER.FIELDS (REFERENCES LIST-ID)] {2}\r\nXX)');
+            });
+
+            it('should process literal when literal count arrives in 3 parts', () => {
+                appendIncomingBuffer('* 1 FETCH (UID {');
+                var iterator1 = client._iterateIncomingBuffer();
+                expect(iterator1.next().value).to.be.undefined;
+
+                appendIncomingBuffer('1');
+                var iterator2 = client._iterateIncomingBuffer();
+                expect(iterator2.next().value).to.be.undefined;
+
+                appendIncomingBuffer('}\r\n1)\r\n');
+                var iterator3 = client._iterateIncomingBuffer();
+                expect(String.fromCharCode.apply(null, iterator3.next().value)).to.equal('* 1 FETCH (UID {1}\r\n1)');
+                expect(iterator3.next().value).to.be.undefined;
+            });
+
+            it('should process SEARCH response when it arrives in 2 parts', () => {
+                appendIncomingBuffer('* SEARCH 1 2');
+                var iterator1 = client._iterateIncomingBuffer();
+                expect(iterator1.next().value).to.be.undefined;
+
+                appendIncomingBuffer(' 3 4\r\n');
+                var iterator2 = client._iterateIncomingBuffer();
+                expect(String.fromCharCode.apply(null, iterator2.next().value)).to.equal('* SEARCH 1 2 3 4');
+                expect(iterator2.next().value).to.be.undefined;
+            });
+
+            it('should not process {} in string as literal 1', () => {
+                appendIncomingBuffer('* 1 FETCH (UID 1 ENVELOPE ("string with {parenthesis}"))\r\n');
+                var iterator = client._iterateIncomingBuffer();
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 1 FETCH (UID 1 ENVELOPE ("string with {parenthesis}"))');
+            });
+
+            it('should not process {} in string as literal 2', () => {
+                appendIncomingBuffer('* 1 FETCH (UID 1 ENVELOPE ("string with number in parenthesis {123}"))\r\n');
+                var iterator = client._iterateIncomingBuffer();
+                expect(String.fromCharCode.apply(null, iterator.next().value)).to.equal ('* 1 FETCH (UID 1 ENVELOPE ("string with number in parenthesis {123}"))');
+            });
+
+            function appendIncomingBuffer(content) {
+                client._incomingBuffers.push(mimefuncs.toTypedArray(content));
+            }
         });
 
         describe('#_parseIncomingCommands', () => {
@@ -158,7 +290,7 @@
                 client.onready = sinon.stub();
                 sinon.stub(client, '_handleResponse');
 
-                function* gen() { yield 'OK Hello world!'; }
+                function* gen() { yield mimefuncs.toTypedArray('OK Hello world!'); }
 
                 client._parseIncomingCommands(gen());
 
@@ -176,7 +308,7 @@
             it('should process an untagged item from the queue', () => {
                 sinon.stub(client, '_handleResponse');
 
-                function* gen() { yield '* 1 EXISTS'; }
+                function* gen() { yield mimefuncs.toTypedArray('* 1 EXISTS'); }
 
                 client._parseIncomingCommands(gen());
 
@@ -191,7 +323,7 @@
             it('should process a plus tagged item from the queue', () => {
                 sinon.stub(client, 'send');
 
-                function* gen() { yield '+ Please continue'; }
+                function* gen() { yield mimefuncs.toTypedArray('+ Please continue'); }
                 client._currentCommand = {
                     data: ['literal data']
                 };
@@ -204,7 +336,7 @@
             it('should process an XOAUTH2 error challenge', () => {
                 sinon.stub(client, 'send');
 
-                function* gen() { yield '+ FOOBAR'; }
+                function* gen() { yield mimefuncs.toTypedArray('+ FOOBAR'); }
                 client._currentCommand = {
                     data: [],
                     errorResponseExpectsEmptyLine: true
@@ -239,9 +371,9 @@
 
             it('should invoke global handler if needed', () => {
                 sinon.stub(client, '_processResponse');
-                sinon.stub(client, '_sendRequest');
                 client._globalAcceptUntagged.TEST = () => {};
                 sinon.stub(client._globalAcceptUntagged, 'TEST');
+                sinon.stub(client, '_sendRequest');
 
                 client._currentCommand = {
                     payload: {}
@@ -251,7 +383,7 @@
                     command: 'test'
                 });
 
-                expect(client._sendRequest.callCount).to.equal(1);
+                expect(client._sendRequest.callCount).to.equal(0);
                 expect(client._globalAcceptUntagged.TEST.withArgs({
                     tag: '*',
                     command: 'test'
@@ -544,6 +676,100 @@
                     data: new Uint8Array([1, 2, 3]).buffer
                 });
             });
+        });
+
+        describe('#getPreviouslyQueued', () => {
+            const ctx = {};
+
+            it('should return undefined with empty queue and no current command', () => {
+                client._currentCommand = undefined;
+                client._clientQueue = [];
+
+                expect(testAndGetAttribute()).to.be.undefined;
+            });
+
+            it('should return undefined with empty queue and non-SELECT current command', () => {
+                client._currentCommand = createCommand('TEST');
+                client._clientQueue = [];
+
+                expect(testAndGetAttribute()).to.be.undefined;
+            });
+
+            it('should return current command with empty queue and SELECT current command', () => {
+                client._currentCommand = createCommand('SELECT', 'ATTR');
+                client._clientQueue = [];
+
+                expect(testAndGetAttribute()).to.equal('ATTR');
+            });
+
+            it('should return current command with non-SELECT commands in queue and SELECT current command', () => {
+                client._currentCommand = createCommand('SELECT', 'ATTR');
+                client._clientQueue = [
+                    createCommand('TEST01'),
+                    createCommand('TEST02')
+                ];
+
+                expect(testAndGetAttribute()).to.equal('ATTR');
+            });
+
+            it('should return last SELECT before ctx with multiple SELECT commands in queue (1)', () => {
+                client._currentCommand = createCommand('SELECT', 'ATTR01');
+                client._clientQueue = [
+                    createCommand('SELECT', 'ATTR'),
+                    createCommand('TEST'),
+                    ctx,
+                    createCommand('SELECT', 'ATTR03')
+                ];
+
+                expect(testAndGetAttribute()).to.equal('ATTR');
+
+            });
+
+            it('should return last SELECT before ctx with multiple SELECT commands in queue (2)', () => {
+                client._clientQueue = [
+                    createCommand('SELECT', 'ATTR02'),
+                    createCommand('SELECT', 'ATTR'),
+                    ctx,
+                    createCommand('SELECT', 'ATTR03')
+                ];
+
+                expect(testAndGetAttribute()).to.equal('ATTR');
+            });
+
+            it('should return last SELECT before ctx with multiple SELECT commands in queue (3)', () => {
+                client._clientQueue = [
+                    createCommand('SELECT', 'ATTR02'),
+                    createCommand('SELECT', 'ATTR'),
+                    createCommand('TEST'),
+                    ctx,
+                    createCommand('SELECT', 'ATTR03')
+                ];
+
+                expect(testAndGetAttribute()).to.equal('ATTR');
+            });
+
+            function testAndGetAttribute() {
+                const data = client.getPreviouslyQueued(['SELECT'], ctx);
+                if (data) {
+                    return data.request.attributes[0].value;
+                }
+            }
+
+            function createCommand(command, attribute) {
+                const attributes = [];
+                const data = {
+                    request: { command, attributes }
+                };
+
+                if (attribute) {
+                    data.request.attributes.push({
+                        type: 'STRING',
+                        value: attribute
+                    });
+                }
+
+                return data;
+            }
         });
     });
 }));
